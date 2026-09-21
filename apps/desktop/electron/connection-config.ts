@@ -619,7 +619,27 @@ const LOCAL_PRIMARY_SCOPED_ROUTES = new Set([
   // backend's own shutdown, which SIGTERMs its gateway-restart child.
   'POST /api/gateway/restart',
   'POST /api/gateway/start',
-  'POST /api/gateway/stop'
+  'POST /api/gateway/stop',
+  // Profile-owned state that used to ride a per-profile backend: with one backend
+  // per host these handlers take `?profile=` and resolve the home per request.
+  // Destructive ones (memory reset, curator run, hook delete, checkpoint prune,
+  // import) REFUSE an unnamed profile while several are served, so the query is
+  // not optional here.
+  'GET /api/memory',
+  'PUT /api/memory/provider',
+  'POST /api/memory/reset',
+  'GET /api/curator',
+  'PUT /api/curator/paused',
+  'POST /api/curator/run',
+  'GET /api/logs',
+  'GET /api/portal',
+  'GET /api/hermes/update/check',
+  'POST /api/local-models/activate',
+  'GET /api/dashboard/themes',
+  'PUT /api/dashboard/theme',
+  'GET /api/dashboard/font',
+  'PUT /api/dashboard/font',
+  'GET /api/dashboard/plugins'
 ])
 
 function localPrimaryRequestScope(opts: ProfileRouteOptions): boolean | null {
@@ -670,6 +690,19 @@ function localPrimaryRequestScope(opts: ProfileRouteOptions): boolean | null {
 
   if (pathname === '/api/profiles' || pathname.startsWith('/api/profiles/')) {
     return false
+  }
+
+  // Whole families whose every handler now takes `?profile=` and resolves the
+  // profile's home per request: webhook subscriptions (`{name}` in the path) and
+  // the /api/ops maintenance routes (doctor, backup/import, hooks, checkpoints,
+  // diagnostics). Their action spawns pass `-p <profile>` to the child, and the
+  // /api/actions poll family above already pins to this same backend.
+  if (pathname === '/api/webhooks' || pathname.startsWith('/api/webhooks/')) {
+    return true
+  }
+
+  if (pathname.startsWith('/api/ops/')) {
+    return true
   }
 
   return null

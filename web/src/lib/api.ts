@@ -69,9 +69,9 @@ export function getManagementProfile(): string {
 }
 
 // Endpoint families that honor ?profile= on the backend (web_server.py
-// _profile_scope or explicit per-profile DB opens). Anything else — ops,
-// cron (which has its own per-job profile params), profiles themselves — is
-// machine-global or self-scoped and must NOT be rewritten.
+// _profile_scope or explicit per-profile DB opens). Anything else — cron (which
+// has its own per-job profile params), profiles themselves — is machine-global or
+// self-scoped and must NOT be rewritten.
 const PROFILE_SCOPED_PREFIXES = [
   "/api/status",
   "/api/gateway",
@@ -97,6 +97,20 @@ const PROFILE_SCOPED_PREFIXES = [
   // consults that one — approving into the global store would grant access
   // the running gateway never sees.
   "/api/pairing",
+  // Memory files, the curator state file, webhook subscriptions, shell hooks,
+  // checkpoints, backups/imports and the dashboard's own theme/font/plugin
+  // preferences all live in a profile home. One backend now serves every
+  // profile, so the switcher's selection has to ride on the request or a reset
+  // lands on the launch profile's data.
+  "/api/memory",
+  "/api/curator",
+  "/api/webhooks",
+  "/api/ops",
+  "/api/logs",
+  "/api/portal",
+  "/api/dashboard/theme",
+  "/api/dashboard/font",
+  "/api/dashboard/plugins",
 ];
 
 function withManagementProfile(url: string): string {

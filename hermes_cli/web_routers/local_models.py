@@ -30,7 +30,7 @@ from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 from hermes_cli import config as config_mod, web_deps
-from hermes_cli.web_routers._common import _CONFIG_MUTATION_LOCK
+from hermes_cli.web_routers._common import _CONFIG_MUTATION_LOCK, _config_profile_scope
 from hermes_cli.local_runtime import (
     binaries, bootstrap, catalog, context_policy, estimator, growth, hardware, hf_browse,
     load_progress, presets, supervisor,
@@ -848,7 +848,7 @@ def local_models_eject(body: ModelEjectBody):
 
 
 @router.post("/api/local-models/activate")
-async def local_models_activate(body: ModelActivateBody):
+async def local_models_activate(body: ModelActivateBody, profile: Optional[str] = None):
     """Make a downloaded model the default for new chats: a config write via the same machinery as
     /api/model/set plus making sure the server is up. NO model loading (residency v2: models load on first
     inference; an empty router costs nothing). Kept as a job for UI continuity."""
@@ -858,12 +858,16 @@ async def local_models_activate(body: ModelActivateBody):
     job = _job("model-activate", body.model_id, model_id=body.model_id)
 
     def _run():
-        _ensure_server(job, config_mod.load_config(), body.model_id,
-                       fail_detail=_SERVER_START_FAILED, skip_msg="activate rescan check skipped")
-        _step(job, "setting-default", "Making it your default")
-        _set_runtime_enabled(True)
-        _assign_default(job, body.model_id)
-        _finish(job, f"{body.model_id} is the default for new chats")
+        # The llama runtime is one host-wide process, but "my default model" is a
+        # config.yaml write — scope it to the profile the request names, inside the job
+        # thread (the contextvar override must be set where the write happens).
+        with _config_profile_scope(profile):
+            _ensure_server(job, config_mod.load_config(), body.model_id,
+                           fail_detail=_SERVER_START_FAILED, skip_msg="activate rescan check skipped")
+            _step(job, "setting-default", "Making it your default")
+            _set_runtime_enabled(True)
+            _assign_default(job, body.model_id)
+            _finish(job, f"{body.model_id} is the default for new chats")
 
     _spawn_job(job, "lr-model-activate", _run, fail_msg="model activate failed: %s")
     return {"job_id": job["job_id"]}
