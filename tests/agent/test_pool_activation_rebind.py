@@ -368,3 +368,194 @@ def test_equal_stamps_break_the_tie_by_priority(monkeypatch):
 
     assert adopt_activated_credential(agent) is True
     assert agent._credential_pool_entry_id == "acct0002", "lowest priority wins an exact tie"
+
+
+def test_a_choice_made_before_the_chat_was_built_is_honoured(monkeypatch):
+    """The user picked an account, then the app restarted (or the chat was reopened).
+
+    The rebuilt session bound the pool head through ``select()`` (priority), which a provider rule
+    can pin to the OTHER account for good. A first-look baseline swallowed the stamp and the chat
+    kept billing the account the user had switched away from until they clicked again.
+    """
+    pool = _pool(
+        _entry("acct0001", "conta-1", priority=0, token="«redacted:sk-…»-one"),
+        _entry("acct0002", "conta-2", priority=1, token="«redacted:sk-…»-two"),
+    )
+    chosen = next(e for e in pool.entries() if e.id == "acct0002")
+    pool._adopt(chosen, persist=False, extra={**(chosen.extra or {}), "activated_at": time.time() - 60})
+    _seed_pool(monkeypatch, pool)
+    agent = _LiveAgent(pool)
+    assert agent._credential_pool_entry_id == "acct0001"  # select() went by priority
+
+    assert adopt_activated_credential(agent) is True
+    assert agent._credential_pool_entry_id == "acct0002"
+    assert adopt_activated_credential(agent) is False  # settled, no re-swap every turn
+
+
+def test_an_activation_lands_between_the_api_calls_of_a_tool_loop(monkeypatch):
+    """``prepare_iteration`` re-checks from the 2nd call on, so a click mid-turn is not parked
+    until the user's next message (a tool loop can run for many minutes)."""
+    import agent.turn_iteration_prep as tip
+
+    calls = []
+    monkeypatch.setattr(
+        "agent.agent_runtime_helpers.adopt_activated_credential", lambda a: calls.append(a) or True,
+    )
+
+    class _Stop(Exception):
+        pass
+
+    class _A:
+        _fallback_activated = False
+        _nous_wire_pending = None
+        step_callback = None
+        _skill_nudge_interval = 0
+
+        def _adopt_nous_key_before_expiry(self):
+            pass
+
+        def _drain_pending_steer(self):
+            raise _Stop  # everything after the activation check is out of scope here
+
+    agent = _A()
+    # The loop passes the count PRE-increment: the 1st request sees 0 (covered by the turn
+    # boundary), the 2nd sees 1 and must already pick up a click made during the 1st.
+    for count, expected in ((0, 0), (1, 1), (2, 2)):
+        try:
+            tip.prepare_iteration(agent, messages=[], api_call_count=count)
+        except _Stop:
+            pass
+        assert len(calls) == expected, f"api_call_count={count}"
+
+    agent._fallback_activated = True  # on a fallback provider the primary's pool is not ours
+    try:
+        tip.prepare_iteration(agent, messages=[], api_call_count=3)
+    except _Stop:
+        pass
+    assert len(calls) == 2
+
+
+def test_a_swap_that_raises_rolls_back_and_retries_later(monkeypatch):
+    """A client rebuild that raises must not leave a half-adopted session nor drop the choice."""
+    pool = _pool(
+        _entry("acct0001", "conta-1", priority=0, token="«redacted:sk-…»-one"),
+        _entry("acct0002", "conta-2", priority=1, token="«redacted:sk-…»-two"),
+    )
+    _seed_pool(monkeypatch, pool)
+    agent = _LiveAgent(pool)
+    original_pool = agent._credential_pool
+    pool.move_entry("acct0002", 0)
+
+    def _boom(entry):
+        agent._credential_pool_entry_id = entry.id  # partially applied before raising
+        raise RuntimeError("TLS config exploded")
+
+    agent._swap_credential = _boom
+    assert adopt_activated_credential(agent) is False
+    assert agent._credential_pool_entry_id == "acct0001"
+    assert agent._credential_pool is original_pool
+
+    del agent._swap_credential  # the next request retries the same choice and lands it
+    assert adopt_activated_credential(agent) is True
+    assert agent._credential_pool_entry_id == "acct0002"
+
+
+def test_restoring_the_primary_applies_an_activation_made_during_fallback(monkeypatch):
+    """The primary rebind selects by priority; the user's pending choice must win the first request."""
+    import agent.agent_runtime_helpers as arh
+
+    calls = []
+    monkeypatch.setattr(arh, "adopt_activated_credential", lambda a, **kw: calls.append(a) or True)
+    monkeypatch.setattr(arh, "_primary_reset_gate_blocks", lambda *a, **k: (False, None, None))
+    for name in ("_apply_primary_runtime_fields", "_restore_runtime_capabilities", "_rebuild_primary_client",
+                 "_rebind_primary_credential_pool"):
+        monkeypatch.setattr(arh, name, lambda *a, **k: None)
+    import agent.chat_completion_helpers as cch
+    monkeypatch.setattr(cch, "_reset_stale_streak", lambda a: None)
+    monkeypatch.setattr(cch, "rewrite_prompt_model_identity", lambda *a: None)
+
+    class _Compressor:
+        def update_model(self, **kw):
+            pass
+
+    class _A:
+        _fallback_activated = True
+        _rate_limited_until = 0
+        model, provider, api_mode = "claude-opus-5", "anthropic", "anthropic_messages"
+        _cache_disabled = False
+        _compression_feasibility_checked = False
+        _provider_fallback_active = False
+        _primary_runtime = {
+            "provider": "anthropic", "model": "claude-opus-5", "base_url": _BASE,
+            "use_prompt_caching": True, "compressor_model": "m", "compressor_context_length": 1,
+            "compressor_base_url": _BASE, "compressor_api_key": "k", "compressor_provider": "anthropic",
+        }
+        context_compressor = _Compressor()
+
+        def _emit_diagnostic_status(self, text):
+            pass
+
+    monkeypatch.setattr("agent.fallback_cooldown._is_entitlement_rejected", lambda *a: False)
+    agent = _A()
+    assert arh.restore_primary_runtime(agent) is True
+    assert calls == [agent]
+
+
+def test_a_supplied_pool_never_arms_the_store_short_circuit(monkeypatch):
+    """Primary restore hands in the pool it loaded; a click after that load must not be skipped."""
+    pool = _pool(
+        _entry("acct0001", "conta-1", priority=0, token="«redacted:sk-…»-one"),
+        _entry("acct0002", "conta-2", priority=1, token="«redacted:sk-…»-two"),
+    )
+    reads = _count_pool_reads(monkeypatch, pool)
+    store = _stub_store(monkeypatch, (111, 222))
+    agent = _LiveAgent(pool)
+    stale = _pool(
+        _entry("acct0001", "conta-1", priority=0, token="«redacted:sk-…»-one"),
+        _entry("acct0002", "conta-2", priority=1, token="«redacted:sk-…»-two"),
+    )
+    pool.move_entry("acct0002", 0)  # the click, after the caller's load
+    store["value"] = (333, 444)
+
+    assert adopt_activated_credential(agent, fresh=stale) is False  # stale snapshot: nothing new
+    assert adopt_activated_credential(agent) is True  # next check reloads instead of short-circuiting
+    assert agent._credential_pool_entry_id == "acct0002"
+    assert len(reads) == 1
+
+
+def test_a_swap_that_raises_after_publishing_rolls_every_field_back(monkeypatch):
+    """Non-Anthropic swaps publish api_key/base_url before the client rebuild; a raise there must
+    not leave the key of one entry bound to the id of another."""
+    pool = _pool(
+        _entry("acct0001", "conta-1", priority=0, token="«redacted:sk-…»-one"),
+        _entry("acct0002", "conta-2", priority=1, token="«redacted:sk-…»-two"),
+    )
+    _seed_pool(monkeypatch, pool)
+    agent = _LiveAgent(pool)
+    agent.api_key = "«redacted:sk-…»-one"
+    agent.base_url = _BASE
+    agent._client_kwargs = {"api_key": "«redacted:sk-…»-one", "base_url": _BASE}
+
+    def _half_swap(entry):
+        agent.api_key = entry.runtime_api_key
+        agent.base_url = "https://outra.example.test"
+        agent._client_kwargs["api_key"] = entry.runtime_api_key
+        raise RuntimeError("client rebuild exploded")
+
+    agent._swap_credential = _half_swap
+    pool.move_entry("acct0002", 0)
+    attempts = []
+    real_half_swap = _half_swap
+
+    def _counted(entry):
+        attempts.append(entry.id)
+        return real_half_swap(entry)
+
+    agent._swap_credential = _counted
+
+    assert adopt_activated_credential(agent) is False
+    assert attempts == ["acct0002"]  # the swap really ran and raised
+    assert agent._credential_pool_entry_id == "acct0001"
+    assert agent.api_key == "«redacted:sk-…»-one"
+    assert agent.base_url == _BASE
+    assert agent._client_kwargs["api_key"] == "«redacted:sk-…»-one"

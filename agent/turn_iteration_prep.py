@@ -130,6 +130,18 @@ def prepare_iteration(
     except Exception:
         logger.debug("Nous key pre-expiry adoption failed", exc_info=True)
 
+    # An account the user activated mid-turn lands on THIS request, not on their next message: a
+    # tool loop can run for many minutes. The turn boundary already checked iteration 1; the hook
+    # short-circuits on an untouched auth.json (stat only), so later iterations cost ~µs.
+    # ``api_call_count`` is PRE-increment here (bumped further down): 0 on the first request,
+    # which the turn boundary covered; >= 1 is every request after one already went out.
+    if api_call_count >= 1 and not getattr(agent, "_fallback_activated", False):
+        try:
+            from agent.agent_runtime_helpers import adopt_activated_credential
+            adopt_activated_credential(agent)
+        except Exception:
+            logger.debug("Mid-turn account activation check failed", exc_info=True)
+
     # Drain a /steer sent during the last API call so it lands THIS iteration. Delivered as a
     # standalone user row after the newest tool result (never smeared onto the tool row: that
     # row is already persisted append-only, so replay would diverge from the live request and

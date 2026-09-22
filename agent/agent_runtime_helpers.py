@@ -1244,15 +1244,17 @@ def _auth_store_fingerprint() -> "tuple[int, int] | None":
     return (stat.st_mtime_ns, stat.st_size)
 
 
-def adopt_activated_credential(agent) -> bool:
-    """Move a live session onto a credential the USER just activated, at the turn boundary.
+def adopt_activated_credential(agent, *, fresh: Any = None) -> bool:
+    """Move a live session onto the credential the USER activated, before its next API call.
 
     Reordering the pool (``hermes auth priority``, the account-switch chip) only steers sessions
     that resolve their credential afterwards; an open chat keeps billing the account it bound at
     init until a 429/402 rotates it off (#114501 covers the cooldown mirror of this). The deliberate
-    activation stamps ``activated_at``, and this hook adopts it before the turn's first API call:
-    nothing in flight is touched, and the swap is refused when the entry's route cannot serve this
-    conversation's model or endpoint.
+    activation stamps ``activated_at``, and this hook adopts it at the turn boundary and again
+    between the API calls of a tool loop (``prepare_iteration``), so a click lands on the very next
+    request instead of waiting for the user's next message. Nothing in flight is touched (same
+    between-calls point where the 429 recovery already swaps), and the swap is refused when the
+    entry's route cannot serve this conversation's model or endpoint.
 
     Deliberately NOT a re-``select()`` every turn: rotating accounts mid-conversation invalidates the
     provider-side prompt cache (scoped per account), so only an explicit activation moves the session.
@@ -1266,17 +1268,25 @@ def adopt_activated_credential(agent) -> bool:
         return False  # a fallback/foreign pool is attached: its activations are not ours to adopt
     # Short-circuit on an untouched store: an activation always writes auth.json, so an unchanged
     # (mtime, size) means there is nothing new to adopt and the expensive reload can be skipped.
+    # A caller that JUST loaded the pool (primary restore) passes it as ``fresh``: same answer,
+    # without paying the keychain read twice on one boundary.
     fingerprint = _auth_store_fingerprint()
-    if fingerprint is not None and fingerprint == getattr(agent, "_pool_store_fingerprint", None):
-        return False
-    from agent.credential_pool import load_pool
+    if fresh is not None:
+        # The supplied snapshot may predate the store the fingerprint just saw (a click landing
+        # between the caller's load and this check): never arm the short-circuit from it, or that
+        # activation is skipped until auth.json is written again. The next check reloads.
+        fingerprint = None
+    else:
+        if fingerprint is not None and fingerprint == getattr(agent, "_pool_store_fingerprint", None):
+            return False
+        from agent.credential_pool import load_pool
 
-    try:
-        key = resolve_runtime_pool_key(provider, base_url)
-        fresh = load_pool(key) if key else None
-    except Exception as exc:  # noqa: BLE001 - never let a pool read break a turn
-        logger.debug("Activation check could not reload the credential pool: %s", exc)
-        return False
+        try:
+            key = resolve_runtime_pool_key(provider, base_url)
+            fresh = load_pool(key) if key else None
+        except Exception as exc:  # noqa: BLE001 - never let a pool read break a turn
+            logger.debug("Activation check could not reload the credential pool: %s", exc)
+            return False
     if fresh is None or not credential_pool_matches_provider(fresh, provider, base_url=base_url):
         return False
     try:
@@ -1293,13 +1303,13 @@ def adopt_activated_credential(agent) -> bool:
     # "whichever one ``max`` happened to see first" is not a rule anyone can reason about later.
     head = max(candidates, key=lambda e: (_pool_activation_epoch(e), -e.priority, e.id))
     activated_at = _pool_activation_epoch(head)
-    baseline = getattr(agent, "_pool_activation_seen", None)
-    if baseline is None:
-        # First look: stamps that predate this session's binding are history, not a user choice
-        # made during the conversation (same first-look discipline as env credential adoption).
-        agent._pool_activation_seen = activated_at
-        agent._pool_store_fingerprint = fingerprint
-        return False
+    # No first-look baseline: the newest stamp is the account the user CHOSE, and it stays chosen
+    # across restarts. A session built after the click (app restart, chat reopened, new chat) bound
+    # its credential through ``select()``, which reads priority, not stamps, and a provider rule can
+    # pin a manual entry ahead of the chosen one for good (Anthropic keeps manual before seeded).
+    # Swallowing the stamp on first look left such a chat on the wrong account until the user
+    # clicked again. Unstamped pools still never rebind (``activated_at`` is 0.0 below).
+    baseline = getattr(agent, "_pool_activation_seen", None) or 0.0
     if activated_at <= baseline:
         agent._pool_store_fingerprint = fingerprint
         return False
@@ -1332,16 +1342,43 @@ def adopt_activated_credential(agent) -> bool:
         )
         return False
     head = usable
-    agent._pool_activation_seen = activated_at
-    agent._pool_store_fingerprint = fingerprint
     previous_pool = pool
     previous_entry_id = getattr(agent, "_credential_pool_entry_id", None)
+    # Every field a swap can publish, so a raise mid-swap (any api_mode) rolls back whole, not just
+    # the pool binding.
+    _swap_fields = (
+        "api_key", "base_url", "api_mode", "client", "_anthropic_api_key", "_anthropic_base_url",
+        "_anthropic_client", "_is_anthropic_oauth",
+    )
+    _missing = object()
+    previous_fields = {name: getattr(agent, name, _missing) for name in _swap_fields}
+    previous_kwargs = dict(getattr(agent, "_client_kwargs", None) or {})
     agent._credential_pool = fresh
-    if agent._swap_credential(head) is False:
-        # Refused (the entry's route cannot serve this conversation's model): leave the session exactly as it was.
+    try:
+        swapped = agent._swap_credential(head) is not False
+    except Exception as exc:  # noqa: BLE001 - a failed rebuild must not leave a half-adopted session
+        logger.warning("Adopting activated credential %s failed: %s", getattr(head, "id", "?"), exc)
+        swapped = None
+    if not swapped:
+        # Refused (the entry's route cannot serve this conversation's model) or the client rebuild
+        # raised: put the binding back. The baseline is NOT advanced on a raise, so the next request
+        # retries the user's choice instead of silently dropping it.
         agent._credential_pool = previous_pool
         agent._credential_pool_entry_id = previous_entry_id
+        if swapped is None:
+            for name, value in previous_fields.items():
+                if value is not _missing:
+                    with contextlib.suppress(Exception):
+                        setattr(agent, name, value)
+            if isinstance(getattr(agent, "_client_kwargs", None), dict):
+                agent._client_kwargs.clear()
+                agent._client_kwargs.update(previous_kwargs)
+        if swapped is False:
+            agent._pool_activation_seen = activated_at  # settled: this entry cannot serve us
+            agent._pool_store_fingerprint = fingerprint
         return False
+    agent._pool_activation_seen = activated_at
+    agent._pool_store_fingerprint = fingerprint
     # The user's explicit choice outranks a pending automatic revert to the benched credential.
     agent._credential_pool_revert_id = None
     logger.info(
@@ -1350,7 +1387,7 @@ def adopt_activated_credential(agent) -> bool:
     )
     with contextlib.suppress(Exception):
         agent._emit_diagnostic_status(
-            f"🔑 Account switched to {getattr(head, 'label', '?')}; this chat uses it from this turn on."
+            f"🔑 Account switched to {getattr(head, 'label', '?')}; this chat uses it from the next request on."
         )
     return True
 
@@ -1452,6 +1489,10 @@ def restore_primary_runtime(agent) -> bool:
                     f"✅ Primary model restored: {agent.model} via {agent.provider}; "
                     f"fallback {previous_model} via {previous_provider} is no longer active."
                 )
+        # The rebind above selected by priority; an account the user activated while this session
+        # sat on the fallback must win the very first primary request, not the next turn.
+        with contextlib.suppress(Exception):
+            adopt_activated_credential(agent, fresh=getattr(agent, "_credential_pool", None))
         return True
     except Exception as e:
         logger.warning("Failed to restore primary runtime: %s", e)

@@ -7,7 +7,7 @@ import logging
 import threading
 import time
 from contextlib import suppress
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 from agent.lazy_forward import forward as _forward, forward_static as _forward_static, lazy_attr as _lazy_attr
 from hermes_cli.timeouts import get_provider_request_timeout
@@ -878,25 +878,77 @@ class ClientLifecycleMixin:
             or base_url_host_matches(getattr(self, "_anthropic_base_url", "") or "", "azure.com")
         ):
             return False
+        pool_token, fresh_pool = self._pool_bound_anthropic_token()
         try:
-            from agent.anthropic_credentials import resolve_anthropic_token
-            new_token = resolve_anthropic_token(model=self.model)
+            if pool_token is not None:
+                # A pool-bound session renews ITS entry's token (the claude_code row is re-seeded
+                # from ~/.claude on every load). The global resolver below answers "first manual
+                # pool OAuth, else Claude Code" and, run before every request, silently undid every
+                # rotation and user activation: the id said one account, the wire billed another.
+                new_token = pool_token
+            else:
+                from agent.anthropic_credentials import resolve_anthropic_token
+                new_token = resolve_anthropic_token(model=self.model)
         except Exception as exc:
             logger.debug("Anthropic credential refresh failed: %s", exc)
             return False
         new_token = new_token.strip() if isinstance(new_token, str) else ""
         if not new_token or new_token == self._anthropic_api_key:
             return False
-        with suppress(Exception):
-            self._anthropic_client.close()
+        # Build first, close after: a failed build keeps the old (still valid) client in place.
         try:
             base_url = getattr(self, "_anthropic_base_url", None)
-            self._anthropic_client = self._build_direct_anthropic_client(new_token, base_url)
+            new_client = self._build_direct_anthropic_client(new_token, base_url)
         except Exception as exc:
             logger.warning("Failed to rebuild Anthropic client after credential refresh: %s", exc)
             return False
+        with suppress(Exception):
+            self._anthropic_client.close()
+        self._anthropic_client = new_client
         self._anthropic_api_key, self._is_anthropic_oauth = new_token, self._anthropic_oauth_flag(new_token)
+        if pool_token is not None:
+            # Same invariant as _swap_credential: recovery and diagnostics read agent.api_key.
+            self.api_key = new_token
+            if fresh_pool is not None:
+                # The pool object in hand still holds the OLD token for this entry; 401/429 recovery
+                # matches the dispatched key against it and would misattribute the failure.
+                self._credential_pool = fresh_pool
         return True
+
+    def _pool_bound_anthropic_token(self) -> Tuple[Optional[str], Any]:
+        """``(token, fresh_pool)`` of the pool entry THIS session is bound to; ``(None, None)`` when
+        not pool-bound.
+
+        ``None`` sends the caller to the global resolver (env / Claude Code sessions without a pool).
+        A bound session never falls through to it: an unreadable pool or a vanished entry answers
+        with the key in hand, so the refresh is a no-op instead of a silent account switch.
+        ``fresh_pool`` is the reloaded pool the token came from (None when it was not reloaded), so
+        the caller can publish it together with the token.
+        """
+        pool = getattr(self, "_credential_pool", None)
+        if pool is None:
+            return None, None
+        current = getattr(self, "_anthropic_api_key", None) or ""
+        entry_id = getattr(self, "_credential_pool_entry_id", None)
+        if not entry_id:
+            # A pool is attached but the binding was cleared (rebind with nothing selectable, a
+            # failed id sync): keep the key in hand. Only a session with NO pool re-resolves globally.
+            return current, None
+        try:
+            from agent.credential_pool import credential_pool_matches_provider, load_pool, resolve_runtime_pool_key
+            base_url = getattr(self, "base_url", None)
+            if not credential_pool_matches_provider(pool, "anthropic", base_url=base_url):
+                return current, None  # bound to a pool that is not ours: keep the key, never re-resolve
+            key = resolve_runtime_pool_key("anthropic", base_url)
+            fresh = load_pool(key) if key else None
+            entry = next((e for e in fresh.entries() if e.id == entry_id), None) if fresh is not None else None
+        except Exception as exc:  # noqa: BLE001 - a pool read must never re-route the request
+            logger.debug("Pool-bound Anthropic token lookup failed: %s", exc)
+            return current, None
+        if entry is None:
+            return current, None
+        token = (getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", None) or "").strip()
+        return (token, fresh) if token else (current, None)
 
     # ------------------------------------------------------------------ route-derived client config
     def _apply_client_headers_for_base_url(self, base_url: str, *, apply_user_headers: bool = True) -> None:
@@ -955,17 +1007,21 @@ class ClientLifecycleMixin:
             self.api_mode = "chat_completions"
             if hasattr(self, "_transport_cache"):
                 self._transport_cache.clear()
-        self._credential_pool_entry_id = getattr(entry, "id", None)
         from hermes_cli.route_identity import normalize_route_base_url
         route_changed = normalize_route_base_url(self.base_url) != normalize_route_base_url(runtime_base)
         if self.api_mode == "anthropic_messages":
+            # Build BEFORE publishing anything: a raising build must leave the old client, key and
+            # entry id exactly as they were (callers roll back only the pool binding).
+            new_client = self._build_direct_anthropic_client(runtime_key, stripped_base)
+            self._credential_pool_entry_id = getattr(entry, "id", None)
             with suppress(Exception):
                 self._anthropic_client.close()
             self._anthropic_api_key, self._anthropic_base_url = runtime_key, stripped_base
-            self._anthropic_client = self._build_direct_anthropic_client(runtime_key, self._anthropic_base_url)
+            self._anthropic_client = new_client
             self._is_anthropic_oauth = self._anthropic_oauth_flag(runtime_key)
             self.api_key, self.base_url = runtime_key, stripped_base
             return True
+        self._credential_pool_entry_id = getattr(entry, "id", None)
         self.api_key, self.base_url = runtime_key, stripped_base
         # Inlined (not _sync_client_kwargs_credentials): tests call this unbound on a SimpleNamespace agent.
         self._client_kwargs["api_key"] = self.api_key
