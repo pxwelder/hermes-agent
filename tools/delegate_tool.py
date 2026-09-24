@@ -31,7 +31,7 @@ from tools.delegate_tool_config import (  # noqa: F401
     _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children, _get_max_concurrent_children,
     _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
     _inherit_parent_capabilities, _load_config, _merge_request_overrides, _resolve_child_credential_pool,
-    _resolve_child_runtime, _resolve_delegation_credentials,
+    _resolve_child_runtime, _resolve_delegation_credentials, _resolve_task_tiers, _get_delegation_tiers,
     _subagent_auto_approve, _subagent_auto_deny,
 )
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
@@ -365,30 +365,37 @@ def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
     live_deleg_id: Optional[str], live_writers: list, task_images: Optional[List[Optional[List[str]]]] = None,
+    task_routes: Optional[List[Optional[tuple]]] = None,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
-    ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
+    ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure. ``task_routes[i]``, when set, is
+    the ``(creds, routing_cfg)`` of the tier task *i* named; it replaces the call's default route for that child."""
     from tools.delegation_live_log import wrap_progress_callback
     from tools.delegation_output_schema import append_output_contract
-    overrides = {
-        "override_provider": creds["provider"], "override_base_url": creds["base_url"],
-        "override_api_key": creds["api_key"], "override_api_mode": creds["api_mode"],
-        "override_request_overrides": creds.get("request_overrides"),
-        "override_acp_command": creds.get("command"),
-        "override_acp_args": creds.get("args"),
-        "routing_cfg": routing_cfg,
-    }
+
+    def _overrides(c: Dict[str, Any], rcfg: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "override_provider": c["provider"], "override_base_url": c["base_url"],
+            "override_api_key": c["api_key"], "override_api_mode": c["api_mode"],
+            "override_request_overrides": c.get("request_overrides"),
+            "override_acp_command": c.get("command"),
+            "override_acp_args": c.get("args"),
+            "routing_cfg": rcfg,
+        }
+    default_overrides = _overrides(creds, routing_cfg)
     children = []
     for i, t in enumerate(task_list):
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
+        _route = task_routes[i] if task_routes and i < len(task_routes) else None
+        _creds, overrides = (_route[0], _overrides(*_route)) if _route else (creds, default_overrides)
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
-                model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
+                model=_creds["model"], max_iterations=max_iterations, task_count=len(task_list),
                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
             )
         except ValueError as exc:
@@ -502,6 +509,12 @@ def delegate_task(
         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
     if not err:
         task_images, err = _coerce_task_images(task_list, images)
+    task_routes = None
+    if not err:
+        try:
+            task_routes, err = _resolve_task_tiers(task_list, routing_cfg, parent_agent)
+        except ValueError as exc:
+            err = str(exc)
     if err:
         return tool_error(err)
     err = _oneshot_spawn_budget(parent_agent, len(task_list))
@@ -521,6 +534,7 @@ def delegate_task(
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
         routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
+        task_routes=task_routes,
     )
     if err:
         return tool_error(err)
@@ -622,10 +636,35 @@ def _build_dynamic_schema_overrides() -> dict:
             k: v for k, v in tasks["items"]["properties"].items() if k != "group"
         }}
 
+    # `tier` is advertised only when the operator configured delegation.tiers, and only with the configured names:
+    # the model picks among operator-owned routes, never a free-form model id.
+    try:
+        tiers = _get_delegation_tiers()
+    except Exception:
+        tiers = {}
+    if tiers:
+        tasks = overrides_params["properties"]["tasks"]
+        items = dict(tasks["items"])
+        items["properties"] = {**items["properties"], "tier": _tier_param_schema(tiers)}
+        tasks["items"] = items
+
     return {
         "description": _build_top_level_description(independent_completions=independent_completions),
         "parameters": overrides_params,
     }
+
+def _tier_param_schema(tiers: Dict[str, Dict[str, Any]]) -> dict:
+    """``tasks[].tier`` schema: enum of the configured names, each described by its operator-written ``use_for``."""
+    lines = []
+    for name in sorted(tiers):
+        use_for = str(tiers[name].get("use_for") or "").strip()
+        lines.append(f"'{name}'" + (f": {use_for}" if use_for else ""))
+    return _p(
+        "string",
+        "Optional route for THIS child, chosen from the operator's configured tiers (omit to use the default "
+        "delegation route). " + "; ".join(lines) + ".",
+        enum=sorted(tiers),
+    )
 
 def _p(type_: str, description: str, **extra) -> dict:
     return {"type": type_, **extra, "description": description}

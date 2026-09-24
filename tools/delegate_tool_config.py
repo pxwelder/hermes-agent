@@ -434,6 +434,65 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         )
     return _runtime_provider_credentials(values, explicit_request_overrides)
 
+# Route keys a tier may own. A tier inherits every other delegation setting (fallback chain, compression cap,
+# limits) from the delegation section; only the route (model/provider/endpoint) is per tier.
+_TIER_ROUTE_KEYS = ("model", "provider", "base_url", "api_key", "api_mode", "request_overrides")
+
+def _get_delegation_tiers(cfg: Optional[dict] = None) -> Dict[str, Dict[str, Any]]:
+    """``delegation.tiers`` as ``{name: route_dict}``: operator-owned names the model may pick per task. Entries
+    that are not mappings, or carry no model/provider/base_url, are dropped (a tier must route somewhere)."""
+    raw = (cfg if cfg is not None else _load_config()).get("tiers")
+    if not isinstance(raw, dict):
+        return {}
+    tiers: Dict[str, Dict[str, Any]] = {}
+    for name, entry in raw.items():
+        key = str(name or "").strip().lower()
+        if not key or not isinstance(entry, dict):
+            continue
+        if not any(str(entry.get(k) or "").strip() for k in ("model", "provider", "base_url")):
+            continue
+        tiers[key] = entry
+    return tiers
+
+def _tier_routing_cfg(cfg: dict, tier_entry: dict) -> dict:
+    """Delegation section with the tier's route replacing the default one. The default route's keys are cleared
+    first so a tier that names only ``model`` is not glued to a ``base_url`` meant for another model."""
+    merged = {k: v for k, v in cfg.items() if k != "tiers" and k not in _TIER_ROUTE_KEYS}
+    merged.update({k: tier_entry[k] for k in _TIER_ROUTE_KEYS if k in tier_entry})
+    return merged
+
+def _resolve_task_tiers(
+    task_list: List[Dict[str, Any]], cfg: dict, parent_agent,
+) -> tuple[Optional[List[Optional[tuple]]], Optional[str]]:
+    """Per-task ``(creds, routing_cfg)`` for tasks that name a ``tier``; ``None`` in the slot of tasks without one
+    (they keep the call's default route). An unknown tier refuses the whole batch before any child is built:
+    silently running it on the default model would hide a routing mistake behind a model the operator did not
+    choose. Returns ``(None, None)`` when no task names a tier."""
+    if not any(isinstance(t, dict) and str(t.get("tier") or "").strip() for t in task_list):
+        return None, None
+    tiers = _get_delegation_tiers(cfg)
+    if not tiers:
+        return None, (
+            "A task names a 'tier', but delegation.tiers is not configured in config.yaml. "
+            "Remove the tier (the child inherits the default delegation route) or configure the tiers."
+        )
+    resolved: List[Optional[tuple]] = []
+    cache: Dict[str, tuple] = {}
+    for i, t in enumerate(task_list):
+        name = str(t.get("tier") or "").strip().lower()
+        if not name:
+            resolved.append(None)
+            continue
+        if name not in tiers:
+            return None, (
+                f"Task {i} names unknown tier {t.get('tier')!r}. Configured tiers: {', '.join(sorted(tiers))}."
+            )
+        if name not in cache:
+            tier_cfg = _tier_routing_cfg(cfg, tiers[name])
+            cache[name] = (_resolve_delegation_credentials(tier_cfg, parent_agent), tier_cfg)
+        resolved.append(cache[name])
+    return resolved, None
+
 def _load_config() -> dict:
     """The ``delegation`` config section (read-only — do NOT mutate). Prefers the shared ``load_config_readonly()``
     (follows HERMES_HOME/profile; no deepcopy, since this runs on every get_definitions() rebuild) over the legacy
