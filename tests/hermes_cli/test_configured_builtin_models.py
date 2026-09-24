@@ -2,6 +2,8 @@
 
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.model_switch import list_authenticated_providers
 
 
@@ -53,6 +55,19 @@ def test_discover_models_false_pins_the_builtin_catalog():
 
     assert row["models"] == ["configured-x", "shared"], "live ids must not be appended"
     assert row["total_models"] == 2
+
+
+@pytest.mark.parametrize("falsey", ["false", "False", "no", "0"])
+def test_discover_models_string_false_pins_like_the_bool(falsey):
+    """YAML/env round-trips hand back strings; ``_discover_flag`` is the shared parser.
+
+    A plain ``.get("discover_models", True)`` reads ``"false"`` as truthy and
+    silently ignores the pin, which is exactly the inconsistency the helper
+    exists to prevent.
+    """
+    row = _provider_row(["configured-x"], discover_models=falsey)
+
+    assert row["models"] == ["configured-x"]
 
 
 def test_discover_models_false_without_models_keeps_discovery():

@@ -817,7 +817,7 @@ def _lap_builtin_rows(b: _PickerBuild, data: dict, user_providers: dict) -> None
         configured = user_providers.get(hermes_id) if isinstance(user_providers, dict) else None
         configured_models = _declared_model_ids(configured.get("models")) if isinstance(configured, dict) else []
         pins_catalog = (isinstance(configured, dict) and configured_models
-                        and not configured.get("discover_models", True))
+                        and not _discover_flag(configured))
         model_ids = configured_models if pins_catalog else list(dict.fromkeys([*configured_models, *model_ids]))
         pinfo = get_provider_info(mdev_id)
         display_name = pconfig.name if pconfig and pconfig.name else (pinfo.name if pinfo else mdev_id)
