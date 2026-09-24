@@ -5,7 +5,10 @@ from unittest.mock import patch
 from hermes_cli.model_switch import list_authenticated_providers
 
 
-def _provider_row(configured_models, *, max_models=None):
+def _provider_row(configured_models, *, max_models=None, discover_models=None):
+    provider_cfg = {"models": configured_models}
+    if discover_models is not None:
+        provider_cfg["discover_models"] = discover_models
     with (
         patch(
             "agent.models_dev.fetch_models_dev",
@@ -24,7 +27,7 @@ def _provider_row(configured_models, *, max_models=None):
     ):
         rows = list_authenticated_providers(
             current_provider="deepseek",
-            user_providers={"deepseek": {"models": configured_models}},
+            user_providers={"deepseek": provider_cfg},
             max_models=max_models,
         )
     return next(row for row in rows if row["slug"] == "deepseek")
@@ -35,5 +38,27 @@ def test_configured_models_precede_and_deduplicate_discovered_models():
 
     assert row["models"] == ["configured-x", "shared", "live-a"]
     assert row["total_models"] == 3
+
+
+def test_discover_models_false_pins_the_builtin_catalog():
+    """``discover_models: false`` narrows a built-in row to the declared ids.
+
+    Without it a provider's full live catalog is always appended, so a user on a
+    lab with a large catalog cannot reduce the picker to the two or three models
+    they actually use. This is the same opt-in custom endpoints already have;
+    ``_models_config_is_allowlist`` documents ``discover_models: false`` as the
+    way to pin a catalog.
+    """
+    row = _provider_row(["configured-x", "shared"], discover_models=False)
+
+    assert row["models"] == ["configured-x", "shared"], "live ids must not be appended"
+    assert row["total_models"] == 2
+
+
+def test_discover_models_false_without_models_keeps_discovery():
+    """An empty/absent ``models`` list is not a pin — it would blank the row."""
+    row = _provider_row([], discover_models=False)
+
+    assert row["models"] == ["live-a", "shared"]
 
 

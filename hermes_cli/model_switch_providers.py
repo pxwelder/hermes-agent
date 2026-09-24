@@ -811,10 +811,14 @@ def _lap_builtin_rows(b: _PickerBuild, data: dict, user_providers: dict) -> None
             continue
         model_ids = _live_or_curated_ids(hermes_id, b.curated, non_blocking=b.non_blocking_catalogs)
         # A providers.<built-in>.models block extends the discovered catalog; section 3 cannot
-        # emit it later because this row owns the slug.
+        # emit it later because this row owns the slug. With ``discover_models: false`` it pins
+        # instead of extending — the same opt-in custom endpoints have, so a user on a provider
+        # with a large catalog can narrow the picker to the models they actually use.
         configured = user_providers.get(hermes_id) if isinstance(user_providers, dict) else None
         configured_models = _declared_model_ids(configured.get("models")) if isinstance(configured, dict) else []
-        model_ids = list(dict.fromkeys([*configured_models, *model_ids]))
+        pins_catalog = (isinstance(configured, dict) and configured_models
+                        and not configured.get("discover_models", True))
+        model_ids = configured_models if pins_catalog else list(dict.fromkeys([*configured_models, *model_ids]))
         pinfo = get_provider_info(mdev_id)
         display_name = pconfig.name if pconfig and pconfig.name else (pinfo.name if pinfo else mdev_id)
         b.add_builtin_row(

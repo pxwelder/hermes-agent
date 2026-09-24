@@ -72,6 +72,35 @@ def test_cli_picker_hides_excluded_provider(config_home):
     )
 
 
+def test_gateway_picker_hides_excluded_moa_row(config_home, monkeypatch):
+    """``excluded_providers: [moa]`` must also drop the virtual MoA row.
+
+    The MoA row is injected by ``build_models_payload`` AFTER
+    ``list_authenticated_providers`` has applied the exclusion filter, so it used
+    to survive the config that hides every real provider. It lists PRESET names
+    rather than models, which surfaces as a bogus "default" model in the picker.
+    """
+    import yaml
+    from hermes_cli.inventory import build_models_payload, load_picker_context
+
+    def _rows(excluded):
+        cfg = {
+            "model": {"provider": "anthropic", "default": "claude-opus-4"},
+            "custom_providers": [],
+            "moa": {"presets": {"default": {"aggregator": {"model": "claude-opus-4"}}}},
+        }
+        if excluded is not None:
+            cfg["model_catalog"] = {"excluded_providers": excluded}
+        (config_home / "config.yaml").write_text(yaml.safe_dump(cfg))
+        with patch("hermes_cli.model_switch.list_authenticated_providers", return_value=[]):
+            payload = build_models_payload(load_picker_context())
+        return [str(p.get("slug", "")).lower() for p in payload["providers"]]
+
+    assert "moa" in _rows(None), "sanity: the MoA row shows without exclusion"
+    assert "moa" not in _rows(["moa"]), "excluded_providers: [moa] must hide the virtual row"
+    assert "moa" not in _rows(["MoA "]), "matching must normalize case and whitespace"
+
+
 def test_cli_picker_hides_excluded_provider_by_alias(config_home):
     """Exclusion by an alias (not the canonical slug) must also hide the
     provider, matching ``list_authenticated_providers``' matching against

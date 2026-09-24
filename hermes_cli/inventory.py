@@ -116,8 +116,15 @@ def build_models_payload(
             rows = [r for r in rows if not _is_managed_custom(r)]
 
     moa_row = _moa_provider_row(ctx.current_provider)
-    if moa_row is not None:
+    # ``excluded_providers`` is applied inside list_authenticated_providers, which never sees this
+    # row: MoA is injected here, after the filter. Without this check the config silently fails to
+    # hide the virtual row (it lists PRESET names, not models, so it reads as a bogus "default"
+    # model in every picker) while correctly hiding every real provider, as documented.
+    _excluded_slugs = {str(p).strip().lower() for p in (ctx.excluded_providers or []) if p}
+    if moa_row is not None and "moa" not in _excluded_slugs:
         rows = [moa_row] + _without_slug(rows, "moa")
+    elif "moa" in _excluded_slugs:
+        rows = _without_slug(rows, "moa")
 
     if explicit_only:
         rows = _filter_explicit_provider_rows(rows, ctx)
