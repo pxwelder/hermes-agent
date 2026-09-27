@@ -609,6 +609,38 @@ def test_auth_add_codex_oauth_keeps_distinct_pool_accounts(tmp_path, monkeypatch
     assert payload["active_provider"] == "openai-codex"
 
 
+def test_auth_add_same_label_replaces_only_the_dead_entry(tmp_path, monkeypatch, capsys):
+    """Re-login under a dead credential's label retires that row; healthy rows stay."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}, "credential_pool": {"openai-codex": [
+        {"id": "dead01", "label": "wellsec", "auth_type": "oauth", "priority": 0,
+         "source": "manual:device_code", "access_token": "old-at", "refresh_token": "old-rt",
+         "last_status": "dead", "last_status_at": 1.0, "last_error_reason": "invalid_grant"},
+        {"id": "live01", "label": "team", "auth_type": "oauth", "priority": 1,
+         "source": "manual:device_code", "access_token": "team-at", "refresh_token": "team-rt"},
+    ]}})
+    fresh = _jwt_with_email("wellsec@example.com")
+    monkeypatch.setattr("hermes_cli.auth._codex_device_code_login", lambda: {
+        "tokens": {"access_token": fresh, "refresh_token": "new-rt"},
+        "base_url": "https://chatgpt.com/backend-api/codex", "last_refresh": "2026-09-27T00:00:00Z"})
+    from hermes_cli.auth_commands import auth_add_command
+    from agent.credential_pool import load_pool
+
+    class _Args:
+        provider = "openai-codex"
+        auth_type = "oauth"
+        api_key = None
+        label = "wellsec"
+
+    auth_add_command(_Args())
+
+    entries = load_pool("openai-codex").entries()
+    assert sorted(e.label for e in entries) == ["team", "wellsec"]
+    assert "dead01" not in {e.id for e in entries}
+    revived = next(e for e in entries if e.label == "wellsec")
+    assert revived.access_token == fresh and revived.last_status != "dead"
+    assert 'Replaced dead credential "wellsec"' in capsys.readouterr().out
+
 def _codex_jwt(email: str, account_id: str, subject: str) -> str:
     header = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').rstrip(b"=").decode()
     claims = {"email": email, "sub": subject, "https://api.openai.com/auth": {"chatgpt_account_id": account_id}}

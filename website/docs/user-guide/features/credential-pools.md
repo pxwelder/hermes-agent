@@ -292,7 +292,7 @@ Hermes automatically discovers credentials from multiple sources and seeds the p
 | Custom endpoint config | `model.api_key` in config.yaml | Yes (custom endpoints) |
 | Manual entries | Added via `hermes auth add` | Persisted in auth.json |
 
-Auto-seeded entries are updated on each pool load — if you remove an env var, its pool entry is automatically pruned. Manual entries (added via `hermes auth add`) are never auto-pruned.
+Auto-seeded entries are updated on each pool load — if you remove an env var, its pool entry is automatically pruned. Manual entries (added via `hermes auth add`) are never auto-pruned, not even when their login dies: a dead manual entry stays listed (out of rotation) so you can see which account to reconnect. Signing in again with `hermes auth add <provider> --label <same label>` replaces the dead entry; `hermes auth remove` drops it explicitly.
 
 ### Several keys from the environment
 

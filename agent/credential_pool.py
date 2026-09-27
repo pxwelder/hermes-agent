@@ -101,11 +101,11 @@ _TERMINAL_AUTH_REASONS = frozenset({
 # _TERMINAL_AUTH_REASONS (upstream 401 reasons) and handled explicitly.
 CREDENTIAL_PERSIST_FAILED_REASON = "credential_persist_failed"
 
-# DEAD ``manual:*`` entries are pruned after this quiet window — they have no
-# singleton to re-seed from and the user can re-add via ``hermes auth add``.
-# Singleton-seeded entries (device_code, claude_code) are NOT pruned because
-# ``_seed_from_singletons`` would re-create them from the same stale tokens.
-DEAD_MANUAL_PRUNE_TTL_SECONDS = 24 * 60 * 60
+# DEAD ``manual:*`` entries are never pruned automatically. A dead login is the
+# user's account, not garbage: dropping it hides which account needs a re-login
+# and loses its label and position. It stays out of rotation (DEAD never
+# re-enters on a timer) and is replaced when the same label signs in again, or
+# removed explicitly with ``hermes auth remove``.
 
 AUTH_TYPE_OAUTH = "oauth"
 AUTH_TYPE_API_KEY = "api_key"
@@ -1818,7 +1818,6 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         """
         now = time.time()
         cleared_any = False
-        entries_to_prune: List[str] = []
         available: List[PooledCredential] = []
         pending_refresh: List[PooledCredential] = []
         sole_credential = self._is_sole_credential()
@@ -1833,23 +1832,9 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 entry = synced
                 cleared_any = True
             if entry.last_status == STATUS_DEAD:
-                # Manual DEAD credentials are pruned after a 24h quiet window;
-                # singleton-seeded ones stay (audit trail, and the seeder would
-                # re-create them anyway). DEAD never re-enters via TTL — only a
-                # write-side re-auth sync clears it.
-                if _is_manual_source(entry.source):
-                    dead_at = entry.last_status_at or 0
-                    if dead_at and now - dead_at > DEAD_MANUAL_PRUNE_TTL_SECONDS:
-                        logger.warning(
-                            "credential pool: pruning DEAD manual entry %s "
-                            "(reason=%s, age=%.1fh) — re-add via `hermes auth add %s`",
-                            entry.label or entry.id[:8],
-                            entry.last_error_reason or "unknown",
-                            (now - dead_at) / 3600.0,
-                            self.provider,
-                        )
-                        entries_to_prune.append(entry.id)  # can't mutate while iterating
-                        cleared_any = True
+                # DEAD stays in the pool and out of rotation: never pruned on a
+                # timer, never re-entered via TTL. Only a write-side re-auth sync,
+                # a re-login under the same label, or `hermes auth remove` clears it.
                 continue
             if model_cooldown_until(entry, model) is not None:
                 continue
@@ -1880,11 +1865,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 # bearer. The API-key guard above does not cover it.
                 continue
             available.append(entry)
-        if entries_to_prune:
-            pruned_ids = set(entries_to_prune)
-            self._entries = [e for e in self._entries if e.id not in pruned_ids]
         if cleared_any:
-            self._persist(removed_ids=entries_to_prune)
+            self._persist()
         return available, pending_refresh
 
     def _log_no_available_entries(self) -> None:

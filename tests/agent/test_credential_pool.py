@@ -334,12 +334,11 @@ def test_dead_credential_never_re_enters_rotation_after_ttl(tmp_path, monkeypatc
     The exhausted TTL clears entries after 5 min (401) / 1 hour (429).
     A DEAD credential has no recovery TTL — it stays dead until either
     (a) an explicit re-auth write-side sync rewrites the tokens, or
-    (b) the manual-prune TTL elapses (covered by separate tests below).
+    (b) it is replaced by a re-login under the same label, or removed explicitly.
     This test verifies the core invariant in the recent-entry window.
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    # DEAD entry from 2 hours ago — well past the exhausted TTLs (5min/1h)
-    # but well within the 24h manual-prune window.
+    # DEAD entry from 2 hours ago — well past the exhausted TTLs (5min/1h).
     two_hours_ago = time.time() - (2 * 3600)
     _write_auth_store(
         tmp_path,
@@ -500,17 +499,13 @@ def test_generic_401_without_terminal_reason_still_uses_exhausted(tmp_path, monk
     assert persisted["last_error_code"] == 401
 
 
-def test_dead_manual_entry_pruned_after_24h(tmp_path, monkeypatch):
-    """A DEAD manual entry is removed from the pool after the prune TTL.
+def test_dead_manual_entry_is_never_pruned(tmp_path, monkeypatch):
+    """A DEAD manual entry stays in the pool, out of rotation, no matter its age.
 
-    Manual entries (``manual:*``) are independent credentials with no
-    singleton to re-seed from, so we can clean them up after a quiet
-    window without losing recoverability — the user can always re-add
-    via ``hermes auth add``.
+    The user must see which account needs a re-login; dropping the row hid it.
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    # DEAD entry from > 24h ago
-    long_ago = time.time() - (25 * 3600)
+    long_ago = time.time() - (30 * 24 * 3600)
     _write_auth_store(
         tmp_path,
         {
@@ -547,16 +542,16 @@ def test_dead_manual_entry_pruned_after_24h(tmp_path, monkeypatch):
     from agent.credential_pool import load_pool
 
     pool = load_pool("openai-codex")
-    # Trigger _available_entries via select; that runs the prune.
     selected = pool.select()
     assert selected is not None
     assert selected.id == "cred-ok"
 
-    # On-disk pool should have the dead entry removed.
+    # The dead entry is still on disk, still dead.
     auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
-    persisted = auth_payload["credential_pool"]["openai-codex"]
-    assert len(persisted) == 1
-    assert persisted[0]["id"] == "cred-ok"
+    persisted = {e["id"]: e for e in auth_payload["credential_pool"]["openai-codex"]}
+    assert set(persisted) == {"cred-old-dead", "cred-ok"}
+    assert persisted["cred-old-dead"]["last_status"] == "dead"
+    assert [e.id for e in load_pool("openai-codex").entries()] == ["cred-old-dead", "cred-ok"]
 
 
 

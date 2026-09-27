@@ -433,6 +433,7 @@ def _add_credential(args, provider: str, pool, requested_type: str) -> PooledCre
         access_token=token, **spec.fields(creds, provider))
     existing = pool.entries()
     entry = pool.add_entry(entry)
+    _replace_dead_same_label(pool, entry)
     # The first Codex/xAI credential becomes the active provider (as the old singleton save path
     # did implicitly); subsequent adds leave the active provider as-is.
     if spec.activate_first and not existing:
@@ -441,6 +442,30 @@ def _add_credential(args, provider: str, pool, requested_type: str) -> PooledCre
     if provider == "openai-codex":
         _warn_same_codex_account(token, existing)
     return entry
+
+
+def _replace_dead_same_label(pool, fresh: PooledCredential) -> None:
+    """Drop DEAD entries carrying the fresh login's label: the re-login replaces them.
+
+    Dead credentials are never pruned on a timer (the user sees them and knows which
+    account to reconnect), so signing in again under the same label is what retires
+    the dead row. Healthy same-label rows are left alone.
+    """
+    wanted = (fresh.label or "").strip().lower()
+    if not wanted:
+        return
+    while True:
+        stale = next(
+            (idx for idx, e in enumerate(pool.entries(), start=1)
+             if e.id != fresh.id and (e.label or "").strip().lower() == wanted
+             and e.last_status == "dead"),
+            None)
+        if stale is None:
+            return
+        removed = pool.remove_index(stale)
+        if removed is None:
+            return
+        print(f'Replaced dead credential "{removed.label}" with the new login.')
 
 
 def _warn_same_codex_account(token: str, existing: list[PooledCredential]) -> None:
