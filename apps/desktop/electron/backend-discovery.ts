@@ -30,8 +30,7 @@ export interface HostBackendRecord {
 }
 
 export type SpawnOrAttachDecision =
-  | { action: 'attach'; record: HostBackendRecord }
-  | { action: 'spawn'; reason: 'isolated' | 'no-running-backend' }
+  { action: 'attach'; record: HostBackendRecord } | { action: 'spawn'; reason: 'isolated' | 'no-running-backend' }
 
 /** Filename the CLI writes under the machine Hermes root. */
 export const SPAWN_LEDGER_FILENAME = 'spawn-ledger.json'
@@ -51,6 +50,10 @@ function asInteger(value: unknown): number | null {
  *
  * A record without a bound port predates the structured detail (or belongs to
  * a purpose that never binds) and is skipped: a port is the whole point.
+ * A record marked `isolated` (`hermes serve --isolated`, e.g. the backend
+ * another machine's Desktop spawned here over SSH) opted out of the host
+ * singleton and belongs to that client, so it is skipped too; the CLI's
+ * `_attach_to_host_backend` honours the same flag.
  * Unreadable/corrupt JSON yields `[]` — discovery degrades to "spawn", never
  * to a wrong attach.
  */
@@ -86,6 +89,7 @@ export function parseSpawnLedger(contents: unknown): HostBackendRecord[] {
       port === null ||
       port <= 0 ||
       port > 65535 ||
+      entry.isolated === true ||
       !ATTACHABLE_PURPOSES.has(purpose) ||
       !LOOPBACK_DIALABLE.has(host.toLowerCase())
     ) {

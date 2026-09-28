@@ -11,6 +11,8 @@
 export interface DesktopLaunchConfig {
   electronFlags: string[]
   rendererMaxOldSpaceMb: number
+  /** `desktop.renderer_accessibility`; unset when the key is absent or unreadable. */
+  rendererAccessibility?: boolean
 }
 
 export interface PlannedSwitch {
@@ -42,12 +44,7 @@ export function readDesktopLaunchConfig(yamlText: string): DesktopLaunchConfig {
 
   const blockLines: string[] = []
 
-  const splitFlow = (raw: string) =>
-    raw
-      .slice(1, -1)
-      .split(',')
-      .map(unquote)
-      .filter(Boolean)
+  const splitFlow = (raw: string) => raw.slice(1, -1).split(',').map(unquote).filter(Boolean)
 
   for (let i = start + 1; i < lines.length; i += 1) {
     const line = lines[i]
@@ -67,7 +64,15 @@ export function readDesktopLaunchConfig(yamlText: string): DesktopLaunchConfig {
     const [, key, rawValue] = keyed
     const value = rawValue.replace(/\s+#.*$/, '')
 
-    if (key === 'renderer_max_old_space_mb') {
+    if (key === 'renderer_accessibility') {
+      const word = unquote(value).toLowerCase()
+
+      if (['0', 'false', 'no', 'off', 'disabled'].includes(word)) {
+        out.rendererAccessibility = false
+      } else if (['1', 'true', 'yes', 'on', 'enabled'].includes(word)) {
+        out.rendererAccessibility = true
+      }
+    } else if (key === 'renderer_max_old_space_mb') {
       const mb = Number.parseInt(unquote(value), 10)
       out.rendererMaxOldSpaceMb = Number.isFinite(mb) && mb > 0 ? mb : 0
     } else if (key === 'electron_flags') {
@@ -138,7 +143,11 @@ export function planLaunchSwitches(cfg: DesktopLaunchConfig, argv: readonly stri
     const [, name, value] = match
 
     if (name === 'js-flags') {
-      jsFlagParts.push(...String(value ?? '').split(/\s+/).filter(Boolean))
+      jsFlagParts.push(
+        ...String(value ?? '')
+          .split(/\s+/)
+          .filter(Boolean)
+      )
 
       return
     }
