@@ -23,6 +23,14 @@ if __name__ == "__main__":
 from pm.environments import store_root
 
 
+def _inline_string_literal(value: str) -> str:
+    """Keep inline Python source intact through Windows PowerShell's native argv quoting."""
+    if os.name != "nt":
+        return repr(value)
+    escaped = value.encode("unicode_escape").decode("ascii")
+    return "'" + escaped.replace("'", "\\x27").replace('"', "\\x22") + "'"
+
+
 def runtime_command(repo_root: Path, args=(), *, module: str = "hermes_cli.main",
                     code: str | None = None, python: str | Path | None = None,
                     home: str | Path | None = None) -> list[str]:
@@ -34,15 +42,15 @@ def runtime_command(repo_root: Path, args=(), *, module: str = "hermes_cli.main"
     """
     root = Path(repo_root).resolve()
     python = python or resolve_store_python(root) or Path(sys.executable)
-    entry = f"exec({code!r})" if code is not None else (
-        f"runpy.run_module({module!r}, run_name='__main__', alter_sys=True)")
-    default_home = (f"{str(home)!r}" if home is not None else
+    entry = f"exec({_inline_string_literal(code)})" if code is not None else (
+        f"runpy.run_module({_inline_string_literal(module)}, run_name='__main__', alter_sys=True)")
+    default_home = (_inline_string_literal(str(home)) if home is not None else
                     "str(__import__('hermes_constants').get_default_hermes_root())")
     bootstrap = (
         "import os, sys, runpy; "
         "os.environ.pop('PYTHONHOME', None); os.environ.pop('PYTHONPATH', None); "
         "os.environ.pop('VIRTUAL_ENV', None); "
-        f"sys.path.insert(0, {str(root)!r}); "
+        f"sys.path.insert(0, {_inline_string_literal(str(root))}); "
         f"os.environ['HERMES_HOME'] = os.environ.get('HERMES_HOME') or {default_home}; "
         "import hermes_bootstrap; "
         + entry
@@ -92,9 +100,24 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
-def resolve_store_python(repo_root: Path) -> Path | None:
-    """Read PM's committed Python tool, without adopting unrecorded bytes."""
-    runtime = store_root(repo_root)
+def resolve_store_python(repo_root: Path, *, publication: bool = False) -> Path | None:
+    """Read PM's committed Python tool, without adopting unrecorded bytes.
+
+    Callers that PERSIST the result in a launcher (``stage_launcher`` and the
+    publication gates below) pass ``publication=True``: the tree's own store
+    wins over an inherited ``HERMES_RUNTIME_DIR``. The override names a store
+    for the running process (an e2e fixture, a desktop toolchain) that a later
+    scratch cleanup may delete, leaving the launcher to exit 127 forever
+    (#131745). It still supplies the store when the tree records none.
+    """
+    if publication:
+        own = _store_python(store_root(repo_root, honor_runtime_override=False))
+        if own is not None:
+            return own
+    return _store_python(store_root(repo_root))
+
+
+def _store_python(runtime: Path) -> Path | None:
     rel = "python.exe" if _is_windows() else "bin/python3"
 
     facts = runtime / "facts.json"
@@ -327,6 +350,7 @@ def _owns_launcher(target: Path, root: Path) -> bool:
         return False
     paths = {str(root / p) for p in (
         "hermes", "run_agent.py", "venv/bin/python", "venv/bin/python3",
+        "venv/bin/hermes",
         ".hermes/bin/hermes", ".hermes/bin/hermes-acp",
     )}
     # Current store launchers pass this Python bootstrap as one shell argument.
@@ -365,7 +389,9 @@ def _publish_conveniences(root: Path, out_dir: Path, names, *, create: bool = Tr
 def stage_launcher(name: str, repo_root: Path, out_dir: Path) -> Path | None:
     """Publish one launcher bound to store Python, or refuse missing tools."""
     repo_root = Path(repo_root)
-    store_python = resolve_store_python(repo_root)
+    # A launcher outlives the process that writes it, so the inherited
+    # runtime override must not displace the tree's own interpreter.
+    store_python = resolve_store_python(repo_root, publication=True)
     if store_python is not None:
         path = mint_launcher(name, repo_root, out_dir, store_python, None)
         if path is not None and path.suffix == ".cmd":
@@ -435,7 +461,7 @@ def expose_cli(project_root: Path | None = None, *, create: bool = True) -> dict
         return {"ok": True, "skipped": "bundle-owns-launchers"}
     if read_install_stamp(root).get("updateMechanism") == "external":
         return {"ok": True, "skipped": "externally-owned"}
-    if resolve_store_python(root) is None:
+    if resolve_store_python(root, publication=True) is None:
         return {"ok": True, "skipped": "no-store-python"}
     try:
         local = root / ".hermes" / "bin"
@@ -600,7 +626,7 @@ if __name__ == "__main__":
     parser.add_argument("out_dir", type=Path)
     args = parser.parse_args()
     repo_root = Path(__file__).resolve().parents[1]
-    if resolve_store_python(repo_root) is None:
+    if resolve_store_python(repo_root, publication=True) is None:
         parser.exit(1, "hermes: store interpreter is missing; finish pm install before publishing launchers\n")
     args.out_dir.mkdir(parents=True, exist_ok=True)
     written = ensure_install_launchers(repo_root, args.out_dir)

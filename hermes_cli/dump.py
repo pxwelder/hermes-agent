@@ -180,8 +180,50 @@ def _config_overrides(config: dict) -> dict[str, str]:
         overrides["toolsets"] = str(user_toolsets)
     fallbacks = config.get("fallback_providers", [])
     if fallbacks:
-        overrides["fallback_providers"] = str(fallbacks)
+        from hermes_cli.debug_redaction import redact_debug_support_text
+
+        overrides["fallback_providers"] = redact_debug_support_text(
+            str(_fallback_debug_projection(fallbacks))
+        )
     return overrides
+
+
+_FALLBACK_DEBUG_FIELDS = (
+    "provider",
+    "model",
+    "base_url",
+    "api_mode",
+    "key_env",
+    "api_key_env",
+    "max_tokens",
+)
+
+
+def _fallback_debug_projection(value) -> list[dict]:
+    """Render only route metadata useful to support; omit arbitrary containers.
+
+    Fallback entries are open mappings consumed by provider-specific code, so a
+    denylist cannot make their ``headers``, ``env``, command/argv, or future
+    fields safe to serialize. Credential pointer names remain useful and carry
+    no values; an inline key is represented only as a source status.
+    """
+    entries = [value] if isinstance(value, dict) else value if isinstance(value, list) else []
+    projected: list[dict] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        item: dict = {}
+        for key in _FALLBACK_DEBUG_FIELDS:
+            child = entry.get(key)
+            if key == "max_tokens":
+                if isinstance(child, (int, float)) and not isinstance(child, bool):
+                    item[key] = child
+            elif isinstance(child, str):
+                item[key] = child
+        if entry.get("api_key"):
+            item["credential_source"] = "inline"
+        projected.append(item)
+    return projected
 
 
 # (env var, dump label) in display order.

@@ -424,17 +424,15 @@ no API server is enabled); it serves three kinds of profile-prefixed paths:
   adapter instance built without a port; the default listener forwards
   `/p/<profile>/<the adapter's usual path>` to it. See
   [Inbound-port platforms under the multiplexer](#inbound-port-platforms-under-the-multiplexer).
-- **WhatsApp (bridge) and Relay are shared ingress owned by the default profile.**
-  The multiplexer never starts them for a secondary: `WHATSAPP_ENABLED=true` in
-  `profiles/work/.env` does nothing on its own. Enable and configure them on the
-  default profile (their inbound is routed to profiles via `profile_routes`), or
-  disable them in the secondary. The gateway logs one INFO line per skipped
-  secondary platform, and if **no** profile runs it a WARNING says the platform
-  is not being served; `hermes gateway status --profile work` shows
-  `whatsapp: not served under multiplex (shared ingress owned by default)`.
-  The one exception is a profile that opted out with `gateway.standalone:
-  true` — it runs its own WhatsApp bridge and relay in its own gateway, as any
-  standalone gateway does.
+- **WhatsApp (bridge) runs per paired profile.** Pair each secondary with
+  `hermes -p work whatsapp`. Each profile uses its own session and bridge port;
+  an unpaired profile is skipped with `whatsapp_unpaired` and a pairing remedy.
+  See [WhatsApp multi-profile setup](messaging/whatsapp.md#multiple-profiles).
+- **Relay remains shared ingress owned by the default profile.** Enable and
+  configure Relay on the default profile, then route inbound to profiles via
+  `profile_routes`. A secondary-only Relay configuration is reported as not served.
+  A profile that opted out with `gateway.standalone: true` runs its own relay
+  in its own gateway, as any standalone gateway does.
 
 Authentication follows the profile named in the URL. Unprefixed endpoints keep
 using the default listener's existing credentials.
@@ -569,7 +567,7 @@ parent conversation.
 
 #### 5. One PID/lock and one status surface
 
-There is a single process-level PID and lock (the multiplexer, under the default home). `hermes status` on the default profile reports the multiplexer and lists the profiles it serves (`Serves: coder, research`). `hermes -p coder status` and `hermes -p coder gateway status` report "running via the default-profile multiplexer" instead of "stopped". The dashboard's `/api/status?profile=coder` / Channels page report the multiplexer as coder's running gateway, with coder's own adapters as its platforms. The single `gateway_state.json` lives under the default home: secondary adapters appear there as `<profile>:<platform>` entries beside `served_profiles`; no per-profile gateway status file is written.
+There is a single process-level PID and lock (the multiplexer, under the default home). `hermes status --full` on the default profile reports the multiplexer and lists the profiles it serves (`Serves: coder, research`). `hermes -p coder status` and `hermes -p coder gateway status` report "running via the default-profile multiplexer" instead of "stopped". The dashboard's `/api/status?profile=coder` / Channels page report the multiplexer as coder's running gateway, with coder's own adapters as its platforms. The single `gateway_state.json` lives under the default home: secondary adapters appear there as `<profile>:<platform>` entries beside `served_profiles`; no per-profile gateway status file is written.
 
 `hermes -p coder cron status` names the single host gateway and the profiles it serves — `Scheduler host: the host gateway (PID 4211) serving profiles default, coder` — then checks coder's own ticker heartbeat and last successful tick. A missing or stale heartbeat produces a warning rather than an unconditional running verdict. `cron list` and `cron create` also warn when a served profile has no fresh heartbeat. `cron status` adds tick-failure details that those lightweight checks do not read.
 
