@@ -22,6 +22,34 @@ class CredentialNotSavedError(RuntimeError):
     """``add_entry`` wrote the pool but the store does not hold the new row."""
 
 
+# Intent of "which account do new chats open on", stored as an epoch in ``entry.extra``.
+# Priority cannot carry it: the Anthropic provider keeps manual logins ahead of seeded ones
+# (documented ordering contract), so asking for position 0 on a seeded account is reverted by
+# the load-time normalisation. A stamp survives that, and only a new chat reads it.
+NEW_CHAT_KEY = "next_chat_at"
+
+
+def new_chat_stamp(entry: Any) -> float:
+    """Epoch of the last "use this account for new chats" choice, 0.0 when none."""
+    try:
+        return max(0.0, float((getattr(entry, "extra", None) or {}).get(NEW_CHAT_KEY) or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def order_for_new_chats(available: list[Any]) -> list[Any]:
+    """``available`` with the most recently chosen entry first; unchanged when nothing is stamped.
+
+    Applied to entries that already passed the availability filter (cooldown, model cooldown,
+    dead), so a stamped account that cannot serve right now falls back to priority order.
+    """
+    stamped = [e for e in available if new_chat_stamp(e) > 0.0]
+    if not stamped:
+        return available
+    top = max(stamped, key=lambda e: (new_chat_stamp(e), -int(getattr(e, "priority", 0) or 0)))
+    return [top, *[e for e in available if e is not top]]
+
+
 class CredentialPoolAdminMixin:
     def reset_status(self, credential_id: str) -> Optional[PooledCredential]:
         """Clear only the target's local error state, preserving sibling cooldowns."""
@@ -84,6 +112,50 @@ class CredentialPoolAdminMixin:
             self._entries = sorted(entries, key=lambda e: e.priority)
             self._persist()
             return self._find(lambda e: e.id == credential_id)
+
+    def prefer_for_new_chats(self, credential_id: str) -> Optional[float]:
+        """Make *credential_id* the account new chats open on; returns the stamp, None if unknown.
+
+        Never reorders priorities and never touches a chat that is already open: those keep
+        the account they are bound to.
+        """
+        with self._lock:
+            entry = self._find(lambda e: e.id == credential_id)
+            if entry is None:
+                return None
+            newest = max((new_chat_stamp(e) for e in self._entries), default=0.0)
+            stamp = max(time.time(), newest + 0.001)
+            self._replace_entry(entry, replace(entry, extra={**entry.extra, NEW_CHAT_KEY: stamp}))
+            self._persist()
+            return stamp
+
+    def clear_new_chat_preference(self, stamp: Optional[float] = None) -> bool:
+        """Drop the new-chat choice. With *stamp*, only when it is still the latest one.
+
+        The guard lets a caller undo its own choice without erasing a later one made by hand.
+        Stored as 0.0 instead of deleting the key: the store merge treats a missing key as
+        "keep the disk copy".
+        """
+        with self._lock:
+            stamped = [e for e in self._entries if new_chat_stamp(e) > 0.0]
+            if not stamped:
+                return False
+            if stamp is not None and max(new_chat_stamp(e) for e in stamped) != stamp:
+                return False
+            for e in stamped:
+                self._replace_entry(e, replace(e, extra={**e.extra, NEW_CHAT_KEY: 0.0}))
+            self._persist()
+            return True
+
+    def next_for_new_session(self, *, model: Optional[str] = None) -> Optional[PooledCredential]:
+        """The entry a chat opened now would bind to. Read-only: no request count, no refresh."""
+        from agent.credential_pool import STRATEGY_FILL_FIRST
+
+        with self._lock:
+            available, _pending = self._available_entries(model=model)
+            if self._strategy == STRATEGY_FILL_FIRST:
+                available = order_for_new_chats(available)
+            return available[0] if available else None
 
     def resolve_target(self, target: Any) -> tuple[Optional[int], Optional[PooledCredential], Optional[str]]:
         raw = str(target or "").strip()

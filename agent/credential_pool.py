@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from agent.credential_pool_admin import CredentialPoolAdminMixin
+from agent.credential_pool_admin import CredentialPoolAdminMixin, order_for_new_chats
 from agent.credential_pool_model_cooldowns import CredentialPoolModelCooldownMixin, model_cooldown_until
 
 import logging
@@ -2185,6 +2185,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             entry = random.choice(available)
         elif self._strategy == STRATEGY_LEAST_USED and len(available) > 1:
             entry = min(available, key=lambda e: e.request_count)
+        elif self._strategy == STRATEGY_FILL_FIRST:
+            # An explicit "use this account for new chats" beats priority order, which the
+            # Anthropic provider pins to manual logins ahead of seeded ones.
+            entry = order_for_new_chats(available)[0]
         else:
             entry = available[0]
         # Count the selection under every strategy. The counter is ``least_used``'s

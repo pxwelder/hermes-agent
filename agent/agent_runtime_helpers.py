@@ -998,9 +998,28 @@ def _recover_rate_limit(pool, *, has_retried_429, error_context, api_key_hint, c
         usage_limit_reached = any(t in context_reason for t in _USAGE_LIMIT_REASON_TOKENS) or any(
             t in context_message for t in _USAGE_LIMIT_MESSAGE_TOKENS
         )
-    if not has_retried_429 and not usage_limit_reached:
+    if not has_retried_429 and not usage_limit_reached and not _long_reset_signalled(error_context):
         return False, True
     return (True, False) if rotate_and_swap(429, "rate limit") else (False, True)
+
+
+# A 429 that names a reset this far away is not a blip: retrying the same key just sleeps
+# through the whole window (Retry-After: 600 stalled the chat for ten minutes) while another
+# account in the pool is free. Below it, the first retry on the same key keeps the prompt cache.
+_IMMEDIATE_ROTATION_RESET_S = 30.0
+
+
+def _long_reset_signalled(error_context) -> bool:
+    reset_at = (error_context or {}).get("reset_at")
+    if reset_at is None:
+        return False
+    try:
+        value = float(reset_at)
+    except (TypeError, ValueError):
+        return False
+    if value > 1e12:  # milliseconds
+        value /= 1000.0
+    return value - time.time() >= _IMMEDIATE_ROTATION_RESET_S
 
 
 def recover_with_credential_pool(
