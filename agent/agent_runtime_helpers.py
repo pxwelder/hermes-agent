@@ -1010,16 +1010,9 @@ _IMMEDIATE_ROTATION_RESET_S = 30.0
 
 
 def _long_reset_signalled(error_context) -> bool:
-    reset_at = (error_context or {}).get("reset_at")
-    if reset_at is None:
-        return False
-    try:
-        value = float(reset_at)
-    except (TypeError, ValueError):
-        return False
-    if value > 1e12:  # milliseconds
-        value /= 1000.0
-    return value - time.time() >= _IMMEDIATE_ROTATION_RESET_S
+    # Same parser the pool uses for its own cooldowns: epoch s, epoch ms, numeric string, ISO-8601.
+    reset_at = _parse_absolute_timestamp((error_context or {}).get("reset_at"))
+    return reset_at is not None and reset_at - time.time() >= _IMMEDIATE_ROTATION_RESET_S
 
 
 def recover_with_credential_pool(

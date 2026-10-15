@@ -1092,6 +1092,12 @@ def _entry_ids(entries: Iterable[Any]) -> dict[str, dict[str, Any]]:
     return {e.get("id"): e for e in entries if isinstance(e, dict) and e.get("id")}
 
 
+def _merge_new_chat_stamp_row(row: dict[str, Any], disk_row: Any) -> dict[str, Any]:
+    from agent.credential_pool_admin import merge_new_chat_stamp
+
+    return merge_new_chat_stamp(row, disk_row)
+
+
 def write_credential_pool(
     provider_id: str, entries: list[dict[str, Any]], *,
     removed_ids: Optional[Iterable[str]] = None,
@@ -1120,10 +1126,13 @@ def write_credential_pool(
         new_ids = set(_entry_ids(sanitized))
         status_cleared = {cid for cid in (status_cleared_ids or ()) if cid}
         merged: list[dict[str, Any]] = [
-            _merge_pool_row_generation(
-                e, existing_by_id.get(e.get("id")), provider_id,
-                base_pair=bases.get(e.get("id")),
-                status_cleared=e.get("id") in status_cleared,
+            _merge_new_chat_stamp_row(
+                _merge_pool_row_generation(
+                    e, existing_by_id.get(e.get("id")), provider_id,
+                    base_pair=bases.get(e.get("id")),
+                    status_cleared=e.get("id") in status_cleared,
+                ),
+                existing_by_id.get(e.get("id")),
             )
             if isinstance(e, dict) else e
             for e in sanitized]

@@ -1,6 +1,7 @@
 """Locked credential-pool administration and target resolution."""
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import replace
 from typing import Any, Optional, Tuple, TYPE_CHECKING
@@ -29,12 +30,31 @@ class CredentialNotSavedError(RuntimeError):
 NEW_CHAT_KEY = "next_chat_at"
 
 
-def new_chat_stamp(entry: Any) -> float:
-    """Epoch of the last "use this account for new chats" choice, 0.0 when none."""
-    try:
-        return max(0.0, float((getattr(entry, "extra", None) or {}).get(NEW_CHAT_KEY) or 0.0))
-    except (TypeError, ValueError):
+def _stamp_event(value: Any) -> float:
+    """A stored stamp as a signed epoch: +t is a choice made at t, -t a choice cleared at t, 0 none."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         return 0.0
+    return float(value)
+
+
+def new_chat_stamp(entry: Any) -> float:
+    """Epoch of the last "use this account for new chats" choice, 0.0 when none or cleared."""
+    return max(0.0, _stamp_event((getattr(entry, "extra", None) or {}).get(NEW_CHAT_KEY)))
+
+
+def merge_new_chat_stamp(row: dict[str, Any], disk_row: Any) -> dict[str, Any]:
+    """Keep the later of two stamp events when a stale pool rewrites the store.
+
+    A pool object holds a snapshot of the rows. Another process (the HUD) may have stamped or
+    cleared a row since; writing the snapshot back must not undo that. A clear is stored as
+    ``-t`` so that it, too, is an event with a time and beats an older choice.
+    """
+    if not isinstance(disk_row, dict):
+        return row
+    disk = _stamp_event(disk_row.get(NEW_CHAT_KEY))
+    if abs(disk) > abs(_stamp_event(row.get(NEW_CHAT_KEY))):
+        return {**row, NEW_CHAT_KEY: disk}
+    return row
 
 
 def order_for_new_chats(available: list[Any]) -> list[Any]:
@@ -133,8 +153,8 @@ class CredentialPoolAdminMixin:
         """Drop the new-chat choice. With *stamp*, only when it is still the latest one.
 
         The guard lets a caller undo its own choice without erasing a later one made by hand.
-        Stored as 0.0 instead of deleting the key: the store merge treats a missing key as
-        "keep the disk copy".
+        Stored as ``-t`` (a clear event with a time) instead of deleting the key or writing 0:
+        the store merge keeps the later event, so a stale pool cannot bring the old choice back.
         """
         with self._lock:
             stamped = [e for e in self._entries if new_chat_stamp(e) > 0.0]
@@ -142,20 +162,25 @@ class CredentialPoolAdminMixin:
                 return False
             if stamp is not None and max(new_chat_stamp(e) for e in stamped) != stamp:
                 return False
+            cleared_at = -max(time.time(), max(new_chat_stamp(e) for e in stamped) + 0.001)
             for e in stamped:
-                self._replace_entry(e, replace(e, extra={**e.extra, NEW_CHAT_KEY: 0.0}))
+                self._replace_entry(e, replace(e, extra={**e.extra, NEW_CHAT_KEY: cleared_at}))
             self._persist()
             return True
 
     def next_for_new_session(self, *, model: Optional[str] = None) -> Optional[PooledCredential]:
         """The entry a chat opened now would bind to. Read-only: no request count, no refresh."""
-        from agent.credential_pool import STRATEGY_FILL_FIRST
+        from agent.credential_pool import STRATEGY_FILL_FIRST, STRATEGY_LEAST_USED
 
         with self._lock:
             available, _pending = self._available_entries(model=model)
+            if not available:
+                return None
             if self._strategy == STRATEGY_FILL_FIRST:
-                available = order_for_new_chats(available)
-            return available[0] if available else None
+                return order_for_new_chats(available)[0]
+            if self._strategy == STRATEGY_LEAST_USED and len(available) > 1:
+                return min(available, key=lambda e: e.request_count)  # what select() will pick
+            return available[0]  # random cannot be previewed; round_robin takes the head too
 
     def resolve_target(self, target: Any) -> tuple[Optional[int], Optional[PooledCredential], Optional[str]]:
         raw = str(target or "").strip()
